@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  glm-asr:
+    build: .
+    container_name: glm-asr
+    ports:
+      - "8000:8000"
+    volumes:
+      - ~/.cache/huggingface:/home/appuser/.cache/huggingface
+    environment:
+      - PORT=8000
+      - MODEL_ID=zai-org/GLM-ASR-Nano-2512
+      - JSON_LOGGING=false
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
