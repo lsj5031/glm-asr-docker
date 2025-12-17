@@ -11,21 +11,64 @@ Inspired by the architecture of [faster-whisper-server](https://github.com/fedir
 - **GPU acceleration**: CUDA support for fast inference
 - **Streaming ready**: FastAPI-based architecture for easy extension
 - **Docker support**: Production-ready containerized deployment
+- **Health checks**: Built-in `/health` endpoint for container orchestration
+- **Graceful shutdown**: Proper SIGTERM handling for clean container termination
+- **Flexible configuration**: Environment variables for port, model selection, and logging
 
 ## Requirements
 
 - Python 3.10+
-- CUDA 12.1 (optional, for GPU acceleration)
+- CUDA 12.8 (optional, for GPU acceleration)
 - FFmpeg
+- Docker & Docker Compose (for containerized setup)
 
 ## Installation
+
+### Quick Start (Docker)
+
+The easiest way to get started is using Docker Compose:
+
+```bash
+# Clone the repository
+git clone https://github.com/lsj5031/glm-asr-docker.git
+cd glm-asr-docker
+
+# Start the service with GPU support
+docker-compose up
+```
+
+The API will be available at `http://localhost:8000`
+
+### Using Make Commands
+
+With the Makefile, you can use convenient commands:
+
+```bash
+# Build the Docker image
+make build
+
+# Run with docker-compose
+make run
+
+# View logs
+make logs
+
+# Open a shell in the container
+make shell
+
+# Clean up (stop and remove containers)
+make clean
+
+# Show all available commands
+make help
+```
 
 ### Local Setup
 
 1. Clone the repository:
 ```bash
 git clone https://github.com/lsj5031/glm-asr-docker.git
-cd glm-asr
+cd glm-asr-docker
 ```
 
 2. Create a virtual environment:
@@ -39,7 +82,19 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-4. Run the server:
+4. (Optional) Install FFmpeg:
+```bash
+# Ubuntu/Debian
+sudo apt-get install ffmpeg
+
+# macOS
+brew install ffmpeg
+
+# Windows (with conda)
+conda install ffmpeg
+```
+
+5. Run the server:
 ```bash
 python server.py
 ```
@@ -53,7 +108,9 @@ The API will be available at `http://localhost:8000`
 Pull the latest image from GitHub Container Registry:
 ```bash
 docker pull ghcr.io/lsj5031/glm-asr-docker:latest
-docker run --gpus all -p 8000:8000 -v ~/.cache/huggingface:/root/.cache/huggingface ghcr.io/lsj5031/glm-asr-docker:latest
+docker run --gpus all -p 8000:8000 \
+  -v ~/.cache/huggingface:/home/appuser/.cache/huggingface \
+  ghcr.io/lsj5031/glm-asr-docker:latest
 ```
 
 #### Build Locally
@@ -61,10 +118,79 @@ docker run --gpus all -p 8000:8000 -v ~/.cache/huggingface:/root/.cache/huggingf
 Build and run with Docker:
 ```bash
 docker build -t glm-asr .
-docker run --gpus all -p 8000:8000 -v ~/.cache/huggingface:/root/.cache/huggingface glm-asr
+docker run --gpus all -p 8000:8000 \
+  -v ~/.cache/huggingface:/home/appuser/.cache/huggingface \
+  glm-asr
+```
+
+#### Using Docker Compose
+
+The simplest method with GPU support:
+```bash
+docker-compose up
+```
+
+## Configuration
+
+Configure the service using environment variables. See `.env.example` for all options:
+
+```env
+# Server port (default: 8000)
+PORT=8000
+
+# Model ID from Hugging Face (default: zai-org/GLM-ASR-Nano-2512)
+MODEL_ID=zai-org/GLM-ASR-Nano-2512
+
+# Enable JSON logging (default: false)
+JSON_LOGGING=false
+```
+
+### Setting Environment Variables
+
+#### With Docker
+```bash
+docker run --gpus all -p 8000:8000 \
+  -e PORT=8000 \
+  -e MODEL_ID=zai-org/GLM-ASR-Nano-2512 \
+  -e JSON_LOGGING=true \
+  glm-asr
+```
+
+#### With Docker Compose
+Edit `docker-compose.yml` and update the `environment` section:
+```yaml
+environment:
+  - PORT=8000
+  - MODEL_ID=zai-org/GLM-ASR-Nano-2512
+  - JSON_LOGGING=false
+```
+
+#### Running Locally
+```bash
+export PORT=8000
+export MODEL_ID=zai-org/GLM-ASR-Nano-2512
+export JSON_LOGGING=false
+python server.py
 ```
 
 ## Usage
+
+### Health Check
+
+Check if the service is running and healthy:
+
+```bash
+curl http://localhost:8000/health
+```
+
+Response:
+```json
+{
+  "status": "healthy",
+  "model_loaded": true,
+  "device": "cuda"
+}
+```
 
 ### Transcribe Audio
 
@@ -74,13 +200,20 @@ curl -X POST "http://localhost:8000/v1/audio/transcriptions" \
   -F "file=@audio.mp3"
 ```
 
+Response:
+```json
+{
+  "text": "Hello, this is a test transcription."
+}
+```
+
 ### List Available Models
 
 ```bash
-curl "http://localhost:8000/v1/models"
+curl http://localhost:8000/v1/models
 ```
 
-Returns:
+Response:
 ```json
 {
   "data": [
@@ -95,6 +228,8 @@ Returns:
 ## API Documentation
 
 Interactive API documentation is available at `http://localhost:8000/docs` when the server is running.
+
+You can also access Redoc documentation at `http://localhost:8000/redoc`
 
 ## Frontend Options
 
@@ -116,6 +251,73 @@ The GLM-ASR project is developed by the ZAI team and represents state-of-the-art
 - Input audio is resampled to 16kHz (optimal for the model)
 - Supports up to 30-second chunks, automatically batched for longer audio
 - Inference runs in bfloat16 precision for efficiency
+- GPU acceleration significantly reduces inference time
+
+### Typical Performance
+
+- Short audio (< 30 seconds): ~2-5 seconds on GPU
+- Long audio (> 1 minute): Processed in 30-second chunks sequentially
+- Without GPU: ~10-30 seconds per chunk
+
+## Troubleshooting
+
+### Container won't start
+- Check logs: `docker-compose logs glm-asr`
+- Ensure GPU drivers are installed: `nvidia-smi`
+- Verify Docker has GPU support: `docker run --rm --gpus all nvidia/cuda:12.8.0-runtime-ubuntu22.04 nvidia-smi`
+
+### Model loading is slow
+- First run downloads the model (~2GB) - this is normal
+- Model is cached in `~/.cache/huggingface/` for subsequent runs
+- Mount this directory as a volume for persistent caching
+
+### Out of memory errors
+- Reduce batch size or use a smaller model
+- Ensure sufficient GPU VRAM (minimum 4GB recommended)
+- Monitor with: `nvidia-smi -l 1`
+
+### Transcription is inaccurate
+- Ensure audio is clear and at 16kHz sample rate
+- Try with different audio preprocessing
+- Audio longer than 60 seconds is chunked automatically
+
+## Docker Best Practices
+
+The Dockerfile uses:
+- **Multi-stage builds**: Smaller final image size
+- **Non-root user**: Enhanced security (appuser, UID 1000)
+- **Health checks**: Automatic container health monitoring
+- **Official PyTorch base**: Latest CUDA/cuDNN support
+- **Proper layer caching**: Faster rebuilds
+
+## Development
+
+### Running Tests
+```bash
+# Run linting
+make lint
+
+# Run container smoke test
+docker build -t glm-asr:test .
+docker run --rm glm-asr:test python -c "from server import app; print('OK')"
+```
+
+### Building for Development
+```bash
+docker build -t glm-asr:dev .
+docker run -it --rm --gpus all -p 8000:8000 glm-asr:dev
+```
+
+## Contributing
+
+Contributions are welcome! Please feel free to submit a pull request.
+
+We especially welcome:
+- Performance optimizations
+- Documentation improvements
+- Additional model support
+- Testing enhancements
+- Docker optimization ideas
 
 ## Acknowledgments
 
@@ -125,16 +327,11 @@ This project builds upon the excellent work of:
 - **faster-whisper-server** - Inspired by [Fedir Zadniprovskyi's architecture](https://github.com/fedirz/faster-whisper-server) for OpenAI-compatible speech API servers
 - **FastAPI** - For the excellent Python web framework
 - **HuggingFace** - For the Transformers library and model hub
+- **PyTorch** - For deep learning infrastructure
 
 ## License
 
 MIT License - See LICENSE file for details
-
-## Contributing
-
-Contributions are welcome. Please feel free to submit a pull request.
-
-We especially welcome enhancements to the Dockerfile to make it smaller and more modern. If you have ideas for optimizing the Docker image (multi-stage builds, better layer caching, Alpine Linux compatibility, etc.), we'd love to see your contributions.
 
 ## Citation
 

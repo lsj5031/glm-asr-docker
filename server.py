@@ -1,7 +1,10 @@
 """GLM-ASR FastAPI server for audio transcription."""
 
+import json
 import logging
 import os
+import signal
+import sys
 import tempfile
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -58,12 +61,50 @@ WHISPER_FEAT_CFG = {
 }
 
 MODEL_ID = os.getenv("MODEL_ID", "zai-org/GLM-ASR-Nano-2512")
+PORT = int(os.getenv("PORT", "8000"))
 CHUNK_DURATION_MS = 30 * 1000  # 30 second chunks
 CHUNK_OVERLAP_MS = 2 * 1000  # 2 second overlap
+JSON_LOGGING = os.getenv("JSON_LOGGING", "false").lower() == "true"
+
+
+def setup_logging() -> None:
+    """Configure logging with optional JSON format."""
+    if JSON_LOGGING:
+        class JSONFormatter(logging.Formatter):
+            def format(self, record: logging.LogRecord) -> str:
+                log_data = {
+                    "timestamp": self.formatTime(record),
+                    "level": record.levelname,
+                    "logger": record.name,
+                    "message": record.getMessage(),
+                }
+                if record.exc_info:
+                    log_data["exception"] = self.formatException(record.exc_info)
+                return json.dumps(log_data)
+
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(JSONFormatter())
+        logging.basicConfig(
+            level=logging.INFO,
+            handlers=[handler],
+        )
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        )
+
+
+def handle_sigterm(signum, frame):
+    """Handle SIGTERM signal for graceful shutdown."""
+    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+    sys.exit(0)
 
 
 async def load_model_fn() -> None:
     """Load model and components on startup."""
+    signal.signal(signal.SIGTERM, handle_sigterm)
+    
     model_state.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model_state.config = AutoConfig.from_pretrained(MODEL_ID, trust_remote_code=True)
@@ -93,6 +134,22 @@ async def lifespan(app: FastAPI) -> None:
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/health")
+async def health() -> dict:
+    """Health check endpoint for container orchestration."""
+    try:
+        if (
+            model_state.model is None
+            or model_state.tokenizer is None
+            or model_state.feature_extractor is None
+        ):
+            return {"status": "loading", "model_loaded": False}
+        return {"status": "healthy", "model_loaded": True, "device": str(model_state.device)}
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return {"status": "unhealthy", "error": str(e)}
 
 
 @app.get("/v1/models")
@@ -505,10 +562,5 @@ async def transcribe(
 if __name__ == "__main__":
     import uvicorn
 
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    setup_logging()
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
