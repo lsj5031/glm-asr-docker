@@ -7,3 +7,5 @@ ffmpeg-python>=0.2.0
 python-multipart>=0.0.6
 torchaudio>=2.0.0
 pydub>=0.25.1
+sse-starlette>=1.6.0
+silero-vad>=5.1
