@@ -18,6 +18,7 @@ import soundfile as sf
 import torch
 import torchaudio
 from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.websockets import WebSocketState
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from silero_vad import load_silero_vad, get_speech_timestamps
@@ -689,9 +690,15 @@ async def websocket_transcribe(websocket: WebSocket, language: str = "auto"):
     audio_buffer = np.array([], dtype=np.float32)
     last_transcription = ""
     silence_start = None
+    last_inference_audio_len = 0  # To track how much new audio we process
 
     try:
         while True:
+            # Check connection state before processing (Starlette specific check)
+            if websocket.client_state != WebSocketState.CONNECTED:
+                logger.info("[WS] Client disconnected (state check)")
+                break
+
             message = await websocket.receive()
 
             if message["type"] == "websocket.disconnect":
@@ -706,8 +713,12 @@ async def websocket_transcribe(websocket: WebSocket, language: str = "auto"):
                 audio_buffer = np.concatenate([audio_buffer, chunk])
 
                 buffer_duration_ms = len(audio_buffer) / WS_SAMPLE_RATE * 1000
+                
+                # Check how much new audio since last inference
+                new_audio_sec = (len(audio_buffer) - last_inference_audio_len) / WS_SAMPLE_RATE
 
                 # Check for VAD-triggered transcription
+                # Optimization: Don't check VAD on every single chunk if buffer is small
                 if len(audio_buffer) >= WS_SAMPLE_RATE * 0.5:  # At least 500ms
                     speech_timestamps = get_speech_timestamps(
                         torch.from_numpy(audio_buffer),
@@ -728,20 +739,39 @@ async def websocket_transcribe(websocket: WebSocket, language: str = "auto"):
                         else:
                             if silence_start is None:
                                 silence_start = ms_since_speech
+                    else:
+                        # No speech detected in buffer - discard if long enough (likely just noise)
+                        if buffer_duration_ms >= 3000:  # 3 seconds of no speech
+                            audio_buffer = np.array([], dtype=np.float32)
+                            last_inference_audio_len = 0
+                            logger.debug("[WS] No speech detected for 3s, buffer discarded")
+                        continue
 
-                    # Transcribe if silence detected or buffer too long
+                    # Transcribe if:
+                    # 1. Silence detected (end of sentence)
+                    # 2. Buffer too long (force update)
+                    # 3. New audio > 0.5s (periodic update) - OPTIMIZATION
                     should_transcribe = False
+                    is_utterance_end = False
                     if silence_start and silence_start >= WS_SILENCE_THRESHOLD_MS:
                         should_transcribe = True
+                        is_utterance_end = True
                         silence_start = None
                     elif buffer_duration_ms >= WS_MAX_BUFFER_MS:
+                        should_transcribe = True
+                        is_utterance_end = True  # Force flush on max buffer
+                    elif new_audio_sec >= 0.5:
                         should_transcribe = True
 
                     if should_transcribe and buffer_duration_ms >= WS_MIN_AUDIO_MS:
                         try:
+                            if websocket.client_state != WebSocketState.CONNECTED:
+                                break
+                                
                             transcript = await transcribe_audio_array(
                                 audio_buffer, WS_SAMPLE_RATE, language=language
                             )
+                            
                             if transcript and transcript != last_transcription:
                                 last_transcription = transcript
                                 await websocket.send_json({
@@ -749,8 +779,22 @@ async def websocket_transcribe(websocket: WebSocket, language: str = "auto"):
                                     "final": False,
                                 })
                                 logger.info(f"[WS] Partial: {transcript[:50]}...")
+                            
+                            # Clear buffer after utterance ends (silence detected or max buffer)
+                            if is_utterance_end:
+                                audio_buffer = np.array([], dtype=np.float32)
+                                last_inference_audio_len = 0
+                                last_transcription = ""
+                                if transcript:
+                                    logger.info("[WS] Utterance complete, buffer cleared")
+                                else:
+                                    logger.info("[WS] Buffer flushed (empty transcript)")
+                            else:
+                                last_inference_audio_len = len(audio_buffer)
+                                
                         except Exception as e:
                             logger.error(f"[WS] Transcription error: {e}")
+                            break
 
             # Handle JSON control messages
             elif "text" in message:
@@ -790,6 +834,8 @@ async def websocket_transcribe(websocket: WebSocket, language: str = "auto"):
     except Exception as e:
         logger.error(f"[WS] Error: {e}", exc_info=True)
     finally:
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.close()
         logger.info("[WS] Connection closed")
 
 
