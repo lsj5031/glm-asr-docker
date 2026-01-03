@@ -3,19 +3,25 @@
 import json
 import logging
 import os
+import shutil
 import signal
 import sys
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
+import anyio
 import ffmpeg
 import numpy as np
 import soundfile as sf
 import torch
 import torchaudio
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from silero_vad import load_silero_vad, get_speech_timestamps
+from sse_starlette.sse import EventSourceResponse
 from pydub import AudioSegment
 from transformers import AutoProcessor, GlmAsrForConditionalGeneration
 
@@ -36,6 +42,7 @@ class ModelState:
         self.model: Optional[GlmAsrForConditionalGeneration] = None
         self.processor: Optional[AutoProcessor] = None
         self.device: Optional[torch.device] = None
+        self.vad_model: Optional[Any] = None
 
 
 model_state = ModelState()
@@ -77,16 +84,8 @@ def setup_logging() -> None:
         )
 
 
-def handle_sigterm(signum: int, frame: Any) -> None:
-    """Handle SIGTERM signal for graceful shutdown."""
-    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
-    sys.exit(0)
-
-
 async def load_model_fn() -> None:
     """Load model and components on startup."""
-    signal.signal(signal.SIGTERM, handle_sigterm)
-
     model_state.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     logger.info(f"Loading processor from {MODEL_ID}...")
@@ -101,6 +100,10 @@ async def load_model_fn() -> None:
     model_state.model.eval()
     logger.info(f"Model loaded on device: {model_state.device}")
 
+    logger.info("Loading Silero VAD model...")
+    model_state.vad_model = load_silero_vad()
+    logger.info("VAD model loaded")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -114,6 +117,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
@@ -135,44 +146,120 @@ async def health() -> dict:
 @app.get("/v1/models")
 async def list_models() -> dict:
     """List available models."""
-    return {"data": [{"id": "glm-nano-2512", "object": "model"}]}
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "glm-nano-2512",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "zai-org",
+            }
+        ],
+    }
 
 
 def split_audio_into_chunks(audio_path: str) -> list[tuple[int, int]]:
-    """Load audio and return list of (start_ms, end_ms) tuples for chunks."""
+    """Load audio and return list of (start_ms, end_ms) tuples for chunks using VAD."""
     try:
         audio = AudioSegment.from_file(audio_path)
         duration_ms = len(audio)
+        
+        # Prepare audio for VAD
+        # Convert to 16kHz mono for VAD
+        audio_vad = audio.set_frame_rate(16000).set_channels(1)
+        # Convert to numpy/tensor
+        wav_data = np.array(audio_vad.get_array_of_samples()).astype(np.float32) / 32768.0
+        wav_tensor = torch.from_numpy(wav_data)
+        
+        # Get speech timestamps
+        # speech_timestamps is list of {'start': int, 'end': int} in samples
+        speech_timestamps = get_speech_timestamps(
+            wav_tensor,
+            model_state.vad_model,
+            sampling_rate=16000,
+            threshold=0.5,
+            min_speech_duration_ms=250,
+            min_silence_duration_ms=500,
+            return_seconds=False
+        )
+        
+        if not speech_timestamps:
+            logger.info("[VAD] No speech detected, falling back to fixed chunking")
+            # Fallback to single chunk or fixed splitting
+            return [(0, duration_ms)]
+
         chunks = []
-        step = CHUNK_DURATION_MS - CHUNK_OVERLAP_MS
+        current_chunk_start = speech_timestamps[0]['start'] / 16  # convert samples to ms
+        current_chunk_end = speech_timestamps[0]['end'] / 16
+        
+        # Helper to convert sample index to ms
+        def s2ms(samples): return samples / 16.0
 
-        for i in range(0, duration_ms, step):
-            chunk_end = min(i + CHUNK_DURATION_MS, duration_ms)
-            chunks.append((i, chunk_end))
-            if chunk_end >= duration_ms:
-                break
-
-        logger.info(f"[AUDIO CHUNKING] Split {duration_ms}ms into {len(chunks)} chunks")
+        for i in range(1, len(speech_timestamps)):
+            seg = speech_timestamps[i]
+            seg_start_ms = s2ms(seg['start'])
+            seg_end_ms = s2ms(seg['end'])
+            
+            # Check if adding this segment would exceed max duration
+            # We look at the gap between current chunk end and this segment end
+            # Ideally we want to cut in the silence between current_chunk_end and seg_start_ms
+            
+            if (seg_end_ms - current_chunk_start) > CHUNK_DURATION_MS:
+                # Close current chunk
+                # Cut point is midpoint of silence or seg_start_ms
+                # But we can just use the previous segment's end or start of this one.
+                # Let's use the start of the current segment as the split point (start of speech)
+                # so the silence belongs to the previous chunk (or ignored)
+                
+                # Refined: We want the chunk to end in silence.
+                # The silence is between `current_chunk_end` and `seg_start_ms`.
+                # Let's split at `seg_start_ms` (minus a small buffer if possible, but strict cut is fine).
+                
+                chunks.append((int(current_chunk_start), int(seg_start_ms)))
+                current_chunk_start = seg_start_ms
+                current_chunk_end = seg_end_ms
+            else:
+                # Extend current chunk
+                current_chunk_end = seg_end_ms
+        
+        # Add final chunk
+        chunks.append((int(current_chunk_start), int(current_chunk_end)))
+        
+        # Sanity check: Ensure we cover the audio reasonable well or at least don't crash
+        # If the last chunk doesn't reach the end, we might miss trailing audio, 
+        # but VAD says it's silence.
+        
+        logger.info(f"[AUDIO CHUNKING] VAD split {duration_ms}ms into {len(chunks)} chunks")
         return chunks
+
     except Exception as e:
         logger.error(f"[AUDIO CHUNKING FAILED] {str(e)}")
-        # Return full duration as single chunk on error
+        # Fallback to fixed duration chunking on error
         try:
             audio = AudioSegment.from_file(audio_path)
-            return [(0, len(audio))]
+            duration_ms = len(audio)
+            chunks = []
+            step = CHUNK_DURATION_MS - CHUNK_OVERLAP_MS
+
+            for i in range(0, duration_ms, step):
+                chunk_end = min(i + CHUNK_DURATION_MS, duration_ms)
+                chunks.append((i, chunk_end))
+                if chunk_end >= duration_ms:
+                    break
+            return chunks
         except Exception:
             return [(0, 0)]
 
 
-def transcribe_audio_array(audio_array: np.ndarray, sampling_rate: int) -> str:
-    """Transcribe a single audio array using the new GLM-ASR API."""
+def _transcribe_audio_array_sync(audio_array: np.ndarray, sampling_rate: int, language: str = "auto") -> str:
+    """Synchronous core transcription function to be run in a thread."""
     assert model_state.model is not None
     assert model_state.processor is not None
 
     # Resample if needed
     target_sr = model_state.processor.feature_extractor.sampling_rate
     if sampling_rate != target_sr:
-        logger.debug(f"Resampling from {sampling_rate} to {target_sr}")
         audio_tensor = torch.from_numpy(audio_array).float()
         if audio_tensor.dim() == 1:
             audio_tensor = audio_tensor.unsqueeze(0)
@@ -181,20 +268,24 @@ def transcribe_audio_array(audio_array: np.ndarray, sampling_rate: int) -> str:
         audio_array = audio_tensor.squeeze(0).numpy()
 
     # Use the processor's apply_transcription_request method
-    inputs = model_state.processor.apply_transcription_request(audio_array)
+    try:
+        if language and language.lower() != "auto":
+            inputs = model_state.processor.apply_transcription_request(audio_array, language=language)
+        else:
+            inputs = model_state.processor.apply_transcription_request(audio_array)
+    except TypeError:
+        inputs = model_state.processor.apply_transcription_request(audio_array)
 
     # Move to device and dtype
     inputs = inputs.to(model_state.model.device, dtype=model_state.model.dtype)
 
     # Generate
-    logger.info("[INFERENCE START] Running model.generate()...")
     with torch.no_grad():
         outputs = model_state.model.generate(
             **inputs,
             do_sample=False,
             max_new_tokens=MAX_NEW_TOKENS,
         )
-    logger.info("[INFERENCE SUCCESS] Generation completed")
 
     # Decode - skip input tokens
     prompt_len = inputs.input_ids.shape[1]
@@ -203,6 +294,15 @@ def transcribe_audio_array(audio_array: np.ndarray, sampling_rate: int) -> str:
         skip_special_tokens=True,
     )[0].strip()
 
+    return transcript
+
+
+async def transcribe_audio_array(audio_array: np.ndarray, sampling_rate: int, language: str = "auto") -> str:
+    """Transcribe a single audio array using the new GLM-ASR API (Offloaded to worker thread)."""
+    transcript = await anyio.to_thread.run_sync(
+        _transcribe_audio_array_sync, audio_array, sampling_rate, language
+    )
+    
     logger.info(
         f"[TRANSCRIPTION RESULT] '{transcript[:100]}'"
         f"{'...' if len(transcript) > 100 else ''}"
@@ -210,10 +310,56 @@ def transcribe_audio_array(audio_array: np.ndarray, sampling_rate: int) -> str:
     return transcript
 
 
-@app.post("/v1/audio/transcriptions", response_model=TranscriptionResponse)
+async def transcribe_stream_generator(
+    audio_path: str,
+    audio_array: np.ndarray,
+    sr: int,
+    chunks: list[tuple[int, int]],
+    language: str = "auto",
+):
+    """Async generator that yields SSE events for each transcribed chunk."""
+    if len(chunks) == 1:
+        logger.info("[SSE STREAM] Processing as single chunk")
+        try:
+            transcript = await transcribe_audio_array(audio_array, sr, language=language)
+            yield {"data": transcript or "[Empty transcription]"}
+        except Exception as e:
+            logger.error(f"[SSE STREAM] Single chunk failed: {str(e)}")
+            yield {"data": f"[Error: {str(e)}]"}
+    else:
+        logger.info(f"[SSE STREAM] Processing {len(chunks)} chunks")
+        audio_segment = AudioSegment.from_file(audio_path)
+
+        for chunk_idx, (start_ms, end_ms) in enumerate(chunks, 1):
+            logger.info(
+                f"[SSE CHUNK {chunk_idx}/{len(chunks)}] Processing {start_ms}ms-{end_ms}ms..."
+            )
+            audio_chunk = audio_segment[start_ms:end_ms]
+            chunk_array = np.array(audio_chunk.get_array_of_samples()).astype(
+                np.float32
+            )
+            chunk_array = chunk_array / 32768.0
+
+            try:
+                chunk_text = await transcribe_audio_array(
+                    chunk_array, audio_chunk.frame_rate, language=language
+                )
+                if chunk_text:
+                    yield {"data": chunk_text}
+                    logger.info(f"[SSE CHUNK {chunk_idx}] Streamed: '{chunk_text[:80]}'")
+            except Exception as e:
+                logger.error(f"[SSE CHUNK {chunk_idx}] Failed: {str(e)}")
+
+    yield {"data": "[DONE]"}
+    logger.info("[SSE STREAM] Streaming complete")
+
+
+@app.post("/v1/audio/transcriptions", response_model=None)
 async def transcribe(
-    file: UploadFile = File(...), language: Optional[str] = "auto"
-) -> TranscriptionResponse:
+    file: UploadFile = File(...),
+    language: Optional[str] = Form("auto"),
+    stream: bool = Form(False),
+):
     """Transcribe audio file to text."""
     logger.debug("=== TRANSCRIPTION REQUEST RECEIVED ===")
 
@@ -333,7 +479,7 @@ async def transcribe(
                         acodec="pcm_s16le",
                         ar=16000,
                     )
-                    ffmpeg.run(out_stream, overwrite_output=True)
+                    await anyio.to_thread.run_sync(lambda: ffmpeg.run(out_stream, overwrite_output=True))
 
                     converted_size = (
                         os.path.getsize(audio_path) if os.path.exists(audio_path) else 0
@@ -391,10 +537,40 @@ async def transcribe(
             # Split audio into chunks if needed
             chunks = split_audio_into_chunks(audio_path)
 
+            # Handle SSE streaming mode
+            if stream:
+                logger.info("[SSE MODE] Preparing streaming response")
+                # Copy audio to persistent temp file for streaming
+                persistent_audio = tempfile.NamedTemporaryFile(
+                    suffix=".wav", delete=False
+                )
+                shutil.copy2(audio_path, persistent_audio.name)
+                persistent_audio.close()
+
+                async def stream_with_cleanup():
+                    try:
+                        async for event in transcribe_stream_generator(
+                            persistent_audio.name, audio_array, sr, chunks, language=language
+                        ):
+                            yield event
+                    finally:
+                        try:
+                            os.unlink(persistent_audio.name)
+                            logger.debug(
+                                f"[SSE CLEANUP] Removed temp file: {persistent_audio.name}"
+                            )
+                        except OSError:
+                            pass
+
+                return EventSourceResponse(
+                    stream_with_cleanup(), media_type="text/event-stream"
+                )
+
+            # Non-streaming mode: process all chunks and return complete response
             if len(chunks) == 1:
                 # Single chunk - process normally
                 logger.info("[AUDIO CHUNKING] Processing as single chunk")
-                transcript = transcribe_audio_array(audio_array, sr)
+                transcript = await transcribe_audio_array(audio_array, sr, language=language)
             else:
                 # Multiple chunks - process each and merge
                 logger.info(
@@ -418,8 +594,8 @@ async def transcribe(
                     chunk_array = chunk_array / 32768.0  # Normalize int16 to float
 
                     try:
-                        chunk_text = transcribe_audio_array(
-                            chunk_array, audio_chunk.frame_rate
+                        chunk_text = await transcribe_audio_array(
+                            chunk_array, audio_chunk.frame_rate, language=language
                         )
 
                         if chunk_text:
@@ -451,6 +627,135 @@ async def transcribe(
         except Exception as e:
             logger.error(f"[INFERENCE ERROR] Unexpected error: {str(e)}", exc_info=True)
             raise HTTPException(500, f"Transcription error: {str(e)}")
+
+
+# WebSocket streaming constants
+WS_SAMPLE_RATE = 16000
+WS_SILENCE_THRESHOLD_MS = 500  # Trigger transcription after 500ms of silence
+WS_MIN_AUDIO_MS = 300  # Minimum audio length to transcribe
+WS_MAX_BUFFER_MS = 30000  # Maximum buffer before forced transcription
+
+
+@app.websocket("/v1/audio/transcriptions/stream")
+async def websocket_transcribe(websocket: WebSocket, language: str = "auto"):
+    """
+    WebSocket endpoint for real-time audio transcription with VAD.
+
+    Client sends:
+    - Binary messages: PCM 16-bit, 16kHz, mono audio chunks
+    - JSON messages: {"action": "stop"} to signal end of recording
+
+    Server sends:
+    - JSON messages: {"text": "...", "final": false/true}
+    """
+    await websocket.accept()
+    logger.info("[WS] Client connected")
+
+    audio_buffer = np.array([], dtype=np.float32)
+    last_transcription = ""
+    silence_start = None
+
+    try:
+        while True:
+            message = await websocket.receive()
+
+            if message["type"] == "websocket.disconnect":
+                break
+
+            # Handle binary audio data
+            if "bytes" in message:
+                audio_bytes = message["bytes"]
+                # Convert PCM 16-bit to float32
+                chunk = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+                chunk = chunk / 32768.0  # Normalize to [-1, 1]
+                audio_buffer = np.concatenate([audio_buffer, chunk])
+
+                buffer_duration_ms = len(audio_buffer) / WS_SAMPLE_RATE * 1000
+
+                # Check for VAD-triggered transcription
+                if len(audio_buffer) >= WS_SAMPLE_RATE * 0.5:  # At least 500ms
+                    speech_timestamps = get_speech_timestamps(
+                        torch.from_numpy(audio_buffer),
+                        model_state.vad_model,
+                        sampling_rate=WS_SAMPLE_RATE,
+                        return_seconds=False,
+                    )
+
+                    has_recent_speech = False
+                    if speech_timestamps:
+                        last_speech_end = speech_timestamps[-1]["end"]
+                        samples_since_speech = len(audio_buffer) - last_speech_end
+                        ms_since_speech = samples_since_speech / WS_SAMPLE_RATE * 1000
+
+                        if ms_since_speech < WS_SILENCE_THRESHOLD_MS:
+                            has_recent_speech = True
+                            silence_start = None
+                        else:
+                            if silence_start is None:
+                                silence_start = ms_since_speech
+
+                    # Transcribe if silence detected or buffer too long
+                    should_transcribe = False
+                    if silence_start and silence_start >= WS_SILENCE_THRESHOLD_MS:
+                        should_transcribe = True
+                        silence_start = None
+                    elif buffer_duration_ms >= WS_MAX_BUFFER_MS:
+                        should_transcribe = True
+
+                    if should_transcribe and buffer_duration_ms >= WS_MIN_AUDIO_MS:
+                        try:
+                            transcript = await transcribe_audio_array(
+                                audio_buffer, WS_SAMPLE_RATE, language=language
+                            )
+                            if transcript and transcript != last_transcription:
+                                last_transcription = transcript
+                                await websocket.send_json({
+                                    "text": transcript,
+                                    "final": False,
+                                })
+                                logger.info(f"[WS] Partial: {transcript[:50]}...")
+                        except Exception as e:
+                            logger.error(f"[WS] Transcription error: {e}")
+
+            # Handle JSON control messages
+            elif "text" in message:
+                try:
+                    data = json.loads(message["text"])
+                    if data.get("action") == "stop":
+                        logger.info("[WS] Stop signal received")
+                        # Final transcription
+                        if len(audio_buffer) >= WS_SAMPLE_RATE * 0.3:
+                            try:
+                                transcript = await transcribe_audio_array(
+                                    audio_buffer, WS_SAMPLE_RATE, language=language
+                                )
+                                await websocket.send_json({
+                                    "text": transcript or "",
+                                    "final": True,
+                                })
+                                logger.info(f"[WS] Final: {transcript[:50] if transcript else '(empty)'}...")
+                            except Exception as e:
+                                logger.error(f"[WS] Final transcription error: {e}")
+                                await websocket.send_json({
+                                    "text": last_transcription,
+                                    "final": True,
+                                    "error": str(e),
+                                })
+                        else:
+                            await websocket.send_json({
+                                "text": last_transcription,
+                                "final": True,
+                            })
+                        break
+                except json.JSONDecodeError:
+                    pass
+
+    except WebSocketDisconnect:
+        logger.info("[WS] Client disconnected")
+    except Exception as e:
+        logger.error(f"[WS] Error: {e}", exc_info=True)
+    finally:
+        logger.info("[WS] Connection closed")
 
 
 if __name__ == "__main__":
