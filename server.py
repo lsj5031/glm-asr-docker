@@ -7,15 +7,18 @@ import shutil
 import signal
 import sys
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
+import anyio
 import ffmpeg
 import numpy as np
 import soundfile as sf
 import torch
 import torchaudio
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from silero_vad import load_silero_vad, get_speech_timestamps
 from sse_starlette.sse import EventSourceResponse
@@ -81,16 +84,8 @@ def setup_logging() -> None:
         )
 
 
-def handle_sigterm(signum: int, frame: Any) -> None:
-    """Handle SIGTERM signal for graceful shutdown."""
-    logger.info(f"Received signal {signum}, initiating graceful shutdown...")
-    sys.exit(0)
-
-
 async def load_model_fn() -> None:
     """Load model and components on startup."""
-    signal.signal(signal.SIGTERM, handle_sigterm)
-
     model_state.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     logger.info(f"Loading processor from {MODEL_ID}...")
@@ -123,6 +118,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/health")
 async def health() -> dict:
@@ -143,44 +146,120 @@ async def health() -> dict:
 @app.get("/v1/models")
 async def list_models() -> dict:
     """List available models."""
-    return {"data": [{"id": "glm-nano-2512", "object": "model"}]}
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "glm-nano-2512",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "zai-org",
+            }
+        ],
+    }
 
 
 def split_audio_into_chunks(audio_path: str) -> list[tuple[int, int]]:
-    """Load audio and return list of (start_ms, end_ms) tuples for chunks."""
+    """Load audio and return list of (start_ms, end_ms) tuples for chunks using VAD."""
     try:
         audio = AudioSegment.from_file(audio_path)
         duration_ms = len(audio)
+        
+        # Prepare audio for VAD
+        # Convert to 16kHz mono for VAD
+        audio_vad = audio.set_frame_rate(16000).set_channels(1)
+        # Convert to numpy/tensor
+        wav_data = np.array(audio_vad.get_array_of_samples()).astype(np.float32) / 32768.0
+        wav_tensor = torch.from_numpy(wav_data)
+        
+        # Get speech timestamps
+        # speech_timestamps is list of {'start': int, 'end': int} in samples
+        speech_timestamps = get_speech_timestamps(
+            wav_tensor,
+            model_state.vad_model,
+            sampling_rate=16000,
+            threshold=0.5,
+            min_speech_duration_ms=250,
+            min_silence_duration_ms=500,
+            return_seconds=False
+        )
+        
+        if not speech_timestamps:
+            logger.info("[VAD] No speech detected, falling back to fixed chunking")
+            # Fallback to single chunk or fixed splitting
+            return [(0, duration_ms)]
+
         chunks = []
-        step = CHUNK_DURATION_MS - CHUNK_OVERLAP_MS
+        current_chunk_start = speech_timestamps[0]['start'] / 16  # convert samples to ms
+        current_chunk_end = speech_timestamps[0]['end'] / 16
+        
+        # Helper to convert sample index to ms
+        def s2ms(samples): return samples / 16.0
 
-        for i in range(0, duration_ms, step):
-            chunk_end = min(i + CHUNK_DURATION_MS, duration_ms)
-            chunks.append((i, chunk_end))
-            if chunk_end >= duration_ms:
-                break
-
-        logger.info(f"[AUDIO CHUNKING] Split {duration_ms}ms into {len(chunks)} chunks")
+        for i in range(1, len(speech_timestamps)):
+            seg = speech_timestamps[i]
+            seg_start_ms = s2ms(seg['start'])
+            seg_end_ms = s2ms(seg['end'])
+            
+            # Check if adding this segment would exceed max duration
+            # We look at the gap between current chunk end and this segment end
+            # Ideally we want to cut in the silence between current_chunk_end and seg_start_ms
+            
+            if (seg_end_ms - current_chunk_start) > CHUNK_DURATION_MS:
+                # Close current chunk
+                # Cut point is midpoint of silence or seg_start_ms
+                # But we can just use the previous segment's end or start of this one.
+                # Let's use the start of the current segment as the split point (start of speech)
+                # so the silence belongs to the previous chunk (or ignored)
+                
+                # Refined: We want the chunk to end in silence.
+                # The silence is between `current_chunk_end` and `seg_start_ms`.
+                # Let's split at `seg_start_ms` (minus a small buffer if possible, but strict cut is fine).
+                
+                chunks.append((int(current_chunk_start), int(seg_start_ms)))
+                current_chunk_start = seg_start_ms
+                current_chunk_end = seg_end_ms
+            else:
+                # Extend current chunk
+                current_chunk_end = seg_end_ms
+        
+        # Add final chunk
+        chunks.append((int(current_chunk_start), int(current_chunk_end)))
+        
+        # Sanity check: Ensure we cover the audio reasonable well or at least don't crash
+        # If the last chunk doesn't reach the end, we might miss trailing audio, 
+        # but VAD says it's silence.
+        
+        logger.info(f"[AUDIO CHUNKING] VAD split {duration_ms}ms into {len(chunks)} chunks")
         return chunks
+
     except Exception as e:
         logger.error(f"[AUDIO CHUNKING FAILED] {str(e)}")
-        # Return full duration as single chunk on error
+        # Fallback to fixed duration chunking on error
         try:
             audio = AudioSegment.from_file(audio_path)
-            return [(0, len(audio))]
+            duration_ms = len(audio)
+            chunks = []
+            step = CHUNK_DURATION_MS - CHUNK_OVERLAP_MS
+
+            for i in range(0, duration_ms, step):
+                chunk_end = min(i + CHUNK_DURATION_MS, duration_ms)
+                chunks.append((i, chunk_end))
+                if chunk_end >= duration_ms:
+                    break
+            return chunks
         except Exception:
             return [(0, 0)]
 
 
-def transcribe_audio_array(audio_array: np.ndarray, sampling_rate: int) -> str:
-    """Transcribe a single audio array using the new GLM-ASR API."""
+def _transcribe_audio_array_sync(audio_array: np.ndarray, sampling_rate: int, language: str = "auto") -> str:
+    """Synchronous core transcription function to be run in a thread."""
     assert model_state.model is not None
     assert model_state.processor is not None
 
     # Resample if needed
     target_sr = model_state.processor.feature_extractor.sampling_rate
     if sampling_rate != target_sr:
-        logger.debug(f"Resampling from {sampling_rate} to {target_sr}")
         audio_tensor = torch.from_numpy(audio_array).float()
         if audio_tensor.dim() == 1:
             audio_tensor = audio_tensor.unsqueeze(0)
@@ -189,20 +268,24 @@ def transcribe_audio_array(audio_array: np.ndarray, sampling_rate: int) -> str:
         audio_array = audio_tensor.squeeze(0).numpy()
 
     # Use the processor's apply_transcription_request method
-    inputs = model_state.processor.apply_transcription_request(audio_array)
+    try:
+        if language and language.lower() != "auto":
+            inputs = model_state.processor.apply_transcription_request(audio_array, language=language)
+        else:
+            inputs = model_state.processor.apply_transcription_request(audio_array)
+    except TypeError:
+        inputs = model_state.processor.apply_transcription_request(audio_array)
 
     # Move to device and dtype
     inputs = inputs.to(model_state.model.device, dtype=model_state.model.dtype)
 
     # Generate
-    logger.info("[INFERENCE START] Running model.generate()...")
     with torch.no_grad():
         outputs = model_state.model.generate(
             **inputs,
             do_sample=False,
             max_new_tokens=MAX_NEW_TOKENS,
         )
-    logger.info("[INFERENCE SUCCESS] Generation completed")
 
     # Decode - skip input tokens
     prompt_len = inputs.input_ids.shape[1]
@@ -211,6 +294,15 @@ def transcribe_audio_array(audio_array: np.ndarray, sampling_rate: int) -> str:
         skip_special_tokens=True,
     )[0].strip()
 
+    return transcript
+
+
+async def transcribe_audio_array(audio_array: np.ndarray, sampling_rate: int, language: str = "auto") -> str:
+    """Transcribe a single audio array using the new GLM-ASR API (Offloaded to worker thread)."""
+    transcript = await anyio.to_thread.run_sync(
+        _transcribe_audio_array_sync, audio_array, sampling_rate, language
+    )
+    
     logger.info(
         f"[TRANSCRIPTION RESULT] '{transcript[:100]}'"
         f"{'...' if len(transcript) > 100 else ''}"
@@ -223,12 +315,13 @@ async def transcribe_stream_generator(
     audio_array: np.ndarray,
     sr: int,
     chunks: list[tuple[int, int]],
+    language: str = "auto",
 ):
     """Async generator that yields SSE events for each transcribed chunk."""
     if len(chunks) == 1:
         logger.info("[SSE STREAM] Processing as single chunk")
         try:
-            transcript = transcribe_audio_array(audio_array, sr)
+            transcript = await transcribe_audio_array(audio_array, sr, language=language)
             yield {"data": transcript or "[Empty transcription]"}
         except Exception as e:
             logger.error(f"[SSE STREAM] Single chunk failed: {str(e)}")
@@ -248,7 +341,9 @@ async def transcribe_stream_generator(
             chunk_array = chunk_array / 32768.0
 
             try:
-                chunk_text = transcribe_audio_array(chunk_array, audio_chunk.frame_rate)
+                chunk_text = await transcribe_audio_array(
+                    chunk_array, audio_chunk.frame_rate, language=language
+                )
                 if chunk_text:
                     yield {"data": chunk_text}
                     logger.info(f"[SSE CHUNK {chunk_idx}] Streamed: '{chunk_text[:80]}'")
@@ -384,7 +479,7 @@ async def transcribe(
                         acodec="pcm_s16le",
                         ar=16000,
                     )
-                    ffmpeg.run(out_stream, overwrite_output=True)
+                    await anyio.to_thread.run_sync(lambda: ffmpeg.run(out_stream, overwrite_output=True))
 
                     converted_size = (
                         os.path.getsize(audio_path) if os.path.exists(audio_path) else 0
@@ -455,7 +550,7 @@ async def transcribe(
                 async def stream_with_cleanup():
                     try:
                         async for event in transcribe_stream_generator(
-                            persistent_audio.name, audio_array, sr, chunks
+                            persistent_audio.name, audio_array, sr, chunks, language=language
                         ):
                             yield event
                     finally:
@@ -475,7 +570,7 @@ async def transcribe(
             if len(chunks) == 1:
                 # Single chunk - process normally
                 logger.info("[AUDIO CHUNKING] Processing as single chunk")
-                transcript = transcribe_audio_array(audio_array, sr)
+                transcript = await transcribe_audio_array(audio_array, sr, language=language)
             else:
                 # Multiple chunks - process each and merge
                 logger.info(
@@ -499,8 +594,8 @@ async def transcribe(
                     chunk_array = chunk_array / 32768.0  # Normalize int16 to float
 
                     try:
-                        chunk_text = transcribe_audio_array(
-                            chunk_array, audio_chunk.frame_rate
+                        chunk_text = await transcribe_audio_array(
+                            chunk_array, audio_chunk.frame_rate, language=language
                         )
 
                         if chunk_text:
@@ -609,8 +704,8 @@ async def websocket_transcribe(websocket: WebSocket, language: str = "auto"):
 
                     if should_transcribe and buffer_duration_ms >= WS_MIN_AUDIO_MS:
                         try:
-                            transcript = transcribe_audio_array(
-                                audio_buffer, WS_SAMPLE_RATE
+                            transcript = await transcribe_audio_array(
+                                audio_buffer, WS_SAMPLE_RATE, language=language
                             )
                             if transcript and transcript != last_transcription:
                                 last_transcription = transcript
@@ -631,8 +726,8 @@ async def websocket_transcribe(websocket: WebSocket, language: str = "auto"):
                         # Final transcription
                         if len(audio_buffer) >= WS_SAMPLE_RATE * 0.3:
                             try:
-                                transcript = transcribe_audio_array(
-                                    audio_buffer, WS_SAMPLE_RATE
+                                transcript = await transcribe_audio_array(
+                                    audio_buffer, WS_SAMPLE_RATE, language=language
                                 )
                                 await websocket.send_json({
                                     "text": transcript or "",
