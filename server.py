@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import shutil
-import signal
 import sys
 import tempfile
 import time
@@ -37,12 +36,16 @@ from transformers import AutoProcessor, GlmAsrForConditionalGeneration
 
 MODEL_ID = os.getenv("MODEL_ID", "zai-org/GLM-ASR-Nano-2512")
 PORT = int(os.getenv("PORT", "8000"))
-CHUNK_DURATION_MS = 30 * 1000  # 30 second chunks
-CHUNK_OVERLAP_MS = 2 * 1000  # 2 second overlap
+CHUNK_DURATION_MS = int(os.getenv("CHUNK_DURATION_MS", "15000"))  # 15 second chunks
+CHUNK_OVERLAP_MS = int(os.getenv("CHUNK_OVERLAP_MS", "1000"))  # 1 second overlap
+VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.6"))
+VAD_MIN_SILENCE_MS = int(os.getenv("VAD_MIN_SILENCE_MS", "300"))
 JSON_LOGGING = os.getenv("JSON_LOGGING", "false").lower() == "true"
 MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "500"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "600"))  # 10 minutes default
 MAX_AUDIO_SIZE_MB = int(os.getenv("MAX_AUDIO_SIZE_MB", "500"))  # 500MB max
+TORCH_COMPILE = os.getenv("TORCH_COMPILE", "false").lower() == "true"
+WARMUP = os.getenv("WARMUP", "true").lower() == "true"
 
 
 def setup_logging() -> None:
@@ -100,9 +103,41 @@ class ModelState:
 model_state = ModelState()
 
 
+def configure_torch_runtime() -> None:
+    """Configure torch runtime settings for lower latency."""
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+        logger.info("Enabled TF32 matmul for CUDA")
+
+
+def warmup_model() -> None:
+    """Run a tiny warmup inference to reduce first-request latency."""
+    if not WARMUP:
+        return
+    if model_state.model is None or model_state.processor is None:
+        return
+
+    try:
+        target_sr = model_state.processor.feature_extractor.sampling_rate
+        dummy_audio = np.zeros(int(target_sr * 0.25), dtype=np.float32)
+        inputs = model_state.processor.apply_transcription_request(dummy_audio)
+        inputs = inputs.to(model_state.model.device, dtype=model_state.model.dtype)
+        with torch.no_grad():
+            model_state.model.generate(
+                **inputs,
+                do_sample=False,
+                max_new_tokens=1,
+            )
+        logger.info("Model warmup complete")
+    except Exception as e:
+        logger.warning(f"Model warmup failed: {e}")
+
+
 async def load_model_fn() -> None:
     """Load model and components on startup."""
     model_state.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    configure_torch_runtime()
 
     logger.info(f"Loading processor from {MODEL_ID}...")
     model_state.processor = AutoProcessor.from_pretrained(MODEL_ID)
@@ -114,11 +149,26 @@ async def load_model_fn() -> None:
         device_map="auto",
     )
     model_state.model.eval()
+
+    if TORCH_COMPILE:
+        if hasattr(torch, "compile"):
+            try:
+                model_state.model = torch.compile(
+                    model_state.model, mode="reduce-overhead"
+                )
+                logger.info("torch.compile enabled (reduce-overhead)")
+            except Exception as e:
+                logger.warning(f"torch.compile failed, continuing without it: {e}")
+        else:
+            logger.warning("torch.compile not available in this torch version")
+
     logger.info(f"Model loaded on device: {model_state.device}")
 
     logger.info("Loading Silero VAD model...")
     model_state.vad_model = load_silero_vad()
     logger.info("VAD model loaded")
+
+    warmup_model()
 
 
 @asynccontextmanager
@@ -217,9 +267,9 @@ def split_audio_into_chunks(audio_path: str) -> list[tuple[int, int]]:
             wav_tensor,
             model_state.vad_model,
             sampling_rate=16000,
-            threshold=0.5,
+            threshold=VAD_THRESHOLD,
             min_speech_duration_ms=250,
-            min_silence_duration_ms=500,
+            min_silence_duration_ms=VAD_MIN_SILENCE_MS,
             return_seconds=False,
         )
 
@@ -286,7 +336,7 @@ def _fixed_duration_chunks(duration_ms: int) -> list[tuple[int, int]]:
     if duration_ms <= 0:
         return [(0, 0)]
     chunks = []
-    step = CHUNK_DURATION_MS - CHUNK_OVERLAP_MS
+    step = max(1, CHUNK_DURATION_MS - CHUNK_OVERLAP_MS)
 
     for i in range(0, duration_ms, step):
         chunk_end = min(i + CHUNK_DURATION_MS, duration_ms)
@@ -447,13 +497,13 @@ async def transcribe(
         if len(content) == 0:
             logger.error("File content is empty")
             raise HTTPException(400, "Empty file received")
-        
+
         # Check max file size
         max_bytes = MAX_AUDIO_SIZE_MB * 1024 * 1024
         if len(content) > max_bytes:
             logger.error(f"File too large: {len(content) / (1024*1024):.1f}MB > {MAX_AUDIO_SIZE_MB}MB")
             raise HTTPException(
-                413, 
+                413,
                 f"File too large. Maximum size: {MAX_AUDIO_SIZE_MB}MB. "
                 f"For longer audio, please split into smaller chunks on the client side."
             )
