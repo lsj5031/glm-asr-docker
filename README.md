@@ -435,10 +435,10 @@ make transcribe INPUT=/app/data/filename.mp3
 
 ## 📚 Documentation
 
-- **[CLI_USAGE.md](CLI_USAGE.md)** - Comprehensive CLI guide
-- **[SUPPORTED_FORMATS.md](SUPPORTED_FORMATS.md)** - All supported formats
-- **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)** - Implementation details
-- **[TEST_RESULTS.md](TEST_RESULTS.md)** - Test results and benchmarks
+- **[CLI_USAGE.md](docs/CLI_USAGE.md)** - Comprehensive CLI guide
+- **[SUPPORTED_FORMATS.md](docs/SUPPORTED_FORMATS.md)** - All supported formats
+- **[GLOBAL_CLI.md](docs/GLOBAL_CLI.md)** - Global CLI wrapper setup and usage
+
 
 ## 🌐 Frontend Options
 
