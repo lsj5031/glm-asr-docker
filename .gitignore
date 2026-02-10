@@ -42,5 +42,8 @@ pip-delete-this-directory.txt
 *.log
 logs/
 
+# Data directory for CLI
+data/
+
 # OS
 Thumbs.db

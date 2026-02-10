@@ -1,33 +1,45 @@
 # GLM-ASR
 
-A FastAPI-based speech-to-text service powered by the GLM-ASR-Nano model. Transcribe audio files with ease using this OpenAI-compatible API.
+A production-ready FastAPI-based speech-to-text service powered by the GLM-ASR-Nano model. Transcribe audio and video files with ease using this OpenAI-compatible API.
 
 Inspired by the architecture of [faster-whisper-server](https://github.com/fedirz/faster-whisper-server) by Fedir Zadniprovskyi.
 
-## Features
+## ✨ Features
 
-- **OpenAI-compatible API**: Drop-in replacement for OpenAI's audio transcription endpoint
-- **Multi-format support**: Handles various audio formats via FFmpeg
-- **GPU acceleration**: CUDA support for fast inference
-- **Streaming ready**: FastAPI-based architecture for easy extension
-- **Docker support**: Production-ready containerized deployment
-- **Health checks**: Built-in `/health` endpoint for container orchestration
-- **Graceful shutdown**: Proper SIGTERM handling for clean container termination
-- **Flexible configuration**: Environment variables for port, model selection, and logging
+### Core Capabilities
+- **🎯 OpenAI-compatible API**: Drop-in replacement for OpenAI's audio transcription endpoint
+- **🎬 Multi-format support**: Handles 30+ audio and video formats via FFmpeg
+- **⚡ GPU acceleration**: CUDA support for fast inference (~8x real-time speed)
+- **📊 Built-in CLI**: Easy-to-use command-line interface for batch processing
+- **🔄 Automatic chunking**: VAD-based smart audio segmentation for long files
+- **📝 Multiple output formats**: Text and SRT subtitle formats
+- **🌐 Multi-language support**: Auto-detection and manual language selection
+- **💪 Production-ready**: Docker support, health checks, graceful shutdown
 
-## Requirements
+### Advanced Features
+- **🎥 Video support**: Automatically extracts audio from video files
+- **📈 Progress tracking**: Real-time progress bars for long transcription jobs
+- **🏥 Health monitoring**: Built-in health check endpoint for orchestration
+- **⚙️ Flexible configuration**: Environment variables for all settings
+- **🔧 WebSocket streaming**: Real-time transcription support
+- **🛡️ Non-root container**: Enhanced security with dedicated user
 
+## 📋 Requirements
+
+### Docker Deployment (Recommended)
+- Docker & Docker Compose
+- CUDA 12.8 + NVIDIA drivers (for GPU acceleration)
+- 4GB+ GPU VRAM
+
+### Local Development
 - Python 3.10+
 - CUDA 12.8 (optional, for GPU acceleration)
 - FFmpeg
-- libsndfile (for audio processing)
-- Docker & Docker Compose (for containerized setup)
+- libsndfile
 
-## Installation
+## 🚀 Quick Start
 
-### Quick Start (Docker)
-
-The easiest way to get started is using Docker Compose:
+### 1. Clone and Start (Easiest)
 
 ```bash
 # Clone the repository
@@ -35,156 +47,196 @@ git clone https://github.com/lsj5031/glm-asr-docker.git
 cd glm-asr-docker
 
 # Start the service with GPU support
-docker-compose up
+docker compose up -d
+
+# Wait for the model to load (~30 seconds)
+docker compose logs -f
 ```
 
-The API will be available at `http://localhost:8000`
+The service will be available at `http://localhost:18000`
+
+### 2. Transcribe Your First File
+
+```bash
+# Create data directory
+mkdir -p data
+
+# Copy your audio/video file
+cp your-file.mp3 data/
+
+# Transcribe using CLI
+make transcribe INPUT=/app/data/your-file.mp3
+
+# Or use docker compose directly
+docker compose exec glm-asr python glm_asr_cli.py transcribe /app/data/your-file.mp3
+```
+
+### 3. Check Server Health
+
+```bash
+make health
+# or
+curl http://localhost:18000/health
+```
+
+## 📦 Installation
+
+### Using Docker Compose (Recommended)
+
+```bash
+# Start the service
+docker compose up -d
+
+# View logs
+docker compose logs -f glm-asr
+
+# Stop the service
+docker compose down
+```
 
 ### Using Make Commands
 
-With the Makefile, you can use convenient commands:
+The Makefile provides convenient shortcuts:
 
 ```bash
-# Build the Docker image
-make build
-
-# Run with docker-compose
-make run
-
-# View logs
-make logs
-
-# Open a shell in the container
-make shell
-
-# Clean up (stop and remove containers)
-make clean
-
 # Show all available commands
 make help
+
+# Container management
+make up          # Start the service
+make build       # Build Docker image
+make logs        # View logs
+make shell       # Open shell in container
+make restart     # Restart the service
+make clean       # Stop and remove containers
+
+# CLI commands
+make transcribe INPUT=/app/data/file.mp3
+make health
+make cli
 ```
 
-### Local Setup
+### Local Development Setup
 
-1. Clone the repository:
 ```bash
-git clone https://github.com/lsj5031/glm-asr-docker.git
-cd glm-asr-docker
-```
+# Create virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
 
-2. Create a virtual environment:
-```bash
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-```
-
-3. Install dependencies:
-```bash
+# Install dependencies
 pip install -r requirements.txt
-```
 
-4. (Optional) Install FFmpeg and libsndfile:
-```bash
-# Ubuntu/Debian
-sudo apt-get install ffmpeg libsndfile1
+# Install FFmpeg (Ubuntu/Debian)
+sudo apt-get update && sudo apt-get install -y ffmpeg libsndfile1
 
-# macOS
-brew install ffmpeg libsndfile
-
-# Windows (with conda)
-conda install ffmpeg libsndfile
-```
-
-5. Run the server:
-```bash
+# Run the server
 python server.py
 ```
 
-The API will be available at `http://localhost:8000`
+## 🎯 CLI Usage (Recommended)
 
-### Docker Setup
+The built-in CLI provides the easiest way to transcribe files:
 
-#### Using Pre-built Image
+### Basic Usage
 
-Pull the latest image from GitHub Container Registry:
 ```bash
-docker pull ghcr.io/lsj5031/glm-asr-docker:latest
-docker run --gpus all -p 8000:8000 \
-  -v ~/.cache/huggingface:/home/appuser/.cache/huggingface \
-  ghcr.io/lsj5031/glm-asr-docker:latest
+# Start the service first
+make up
+
+# Transcribe a single file
+make transcribe INPUT=/app/data/podcast.mp3
+
+# With custom output
+make transcribe INPUT=/app/data/interview.wav OUTPUT=/app/data/transcript.txt
+
+# With specific language
+make transcribe INPUT=/app/data/speech.mp3 LANGUAGE=zh
+
+# To SRT subtitle format
+make transcribe INPUT=/app/data/video.mp4 FORMAT=srt
 ```
 
-#### Build Locally
+### Direct Docker Compose Usage
 
-Build and run with Docker:
 ```bash
-docker build -t glm-asr .
-docker run --gpus all -p 8000:8000 \
-  -v ~/.cache/huggingface:/home/appuser/.cache/huggingface \
-  glm-asr
+# Single file
+docker compose exec glm-asr python glm_asr_cli.py transcribe /app/data/audio.mp3
+
+# With all options
+docker compose exec glm-asr python glm_asr_cli.py transcribe /app/data/audio.mp3 \
+  -o /app/data/output.txt \
+  -l en \
+  -f srt \
+  -c 10
+
+# Batch process directory
+docker compose exec glm-asr python glm_asr_cli.py transcribe /app/data/
+
+# Check health
+docker compose exec glm-asr python glm_asr_cli.py health
+
+# Show help
+docker compose exec glm-asr python glm_asr_cli.py --help
 ```
 
-#### Using Docker Compose
+### CLI Options
 
-The simplest method with GPU support:
+| Option | Short | Description | Default |
+|--------|-------|-------------|---------|
+| `input` | - | Audio file(s) or directory (required) | - |
+| `--output` | `-o` | Output transcript path | Auto-generated |
+| `--server-url` | `-s` | Server URL | http://localhost:8000 |
+| `--language` | `-l` | Language code (ISO 639-1) | auto |
+| `--chunk-minutes` | `-c` | Chunk duration (minutes) | 5 |
+| `--format` | `-f` | Output format (text/srt) | text |
+
+### Wrapper Script
+
+For convenience outside the container:
+
 ```bash
-docker-compose up
+# Make script executable (first time only)
+chmod +x glm-asr.sh
+
+# Use the wrapper
+./glm-asr.sh transcribe data/audio.mp3
+./glm-asr.sh transcribe data/video.mp4 -o data/output.txt
+./glm-asr.sh health
 ```
 
-## Configuration
+## 🎬 Supported Formats
 
-Configure the service using environment variables. See `.env.example` for all options:
+The service supports **all audio and video formats** that FFmpeg can handle:
 
-```env
-# Server port (default: 8000)
-PORT=8000
+### Audio Formats (30+)
+- **Common**: MP3, WAV, FLAC, M4A, AAC, OGG, WMA
+- **Additional**: OPUS, AIFF, AU, RA, AMR, DSD, APE, WV, AC3, DTS
 
-# Model ID from Hugging Face (default: zai-org/GLM-ASR-Nano-2512)
-MODEL_ID=zai-org/GLM-ASR-Nano-2512
+### Video Formats (audio extracted automatically)
+- **Common**: MP4, MOV, AVI, MKV, WEBM, WMV, FLV
+- **Additional**: MPG/MPEG, M4V, TS, MTS, VOB, RM, RMVB
 
-# Enable JSON logging (default: false)
-JSON_LOGGING=false
+### Examples
 
-# Max new tokens for generation (default: 500)
-MAX_NEW_TOKENS=500
-```
-
-### Setting Environment Variables
-
-#### With Docker
 ```bash
-docker run --gpus all -p 8000:8000 \
-  -e PORT=8000 \
-  -e MODEL_ID=zai-org/GLM-ASR-Nano-2512 \
-  -e JSON_LOGGING=true \
-  glm-asr
+# All of these work:
+make transcribe INPUT=/app/data/podcast.mp3
+make transcribe INPUT=/app/data/interview.wav
+make transcribe INPUT=/app/data/meeting.m4a
+make transcribe INPUT=/app/data/lecture.mp4    # Video!
+make transcribe INPUT=/app/data/webinar.mkv    # Video!
+
+# Batch process mixed formats
+cp ~/media/*.{mp3,wav,m4a,mp4,mov} data/
+docker compose exec glm-asr python glm_asr_cli.py transcribe /app/data/
 ```
 
-#### With Docker Compose
-Edit `docker-compose.yml` and update the `environment` section:
-```yaml
-environment:
-  - PORT=8000
-  - MODEL_ID=zai-org/GLM-ASR-Nano-2512
-  - JSON_LOGGING=false
-```
-
-#### Running Locally
-```bash
-export PORT=8000
-export MODEL_ID=zai-org/GLM-ASR-Nano-2512
-export JSON_LOGGING=false
-python server.py
-```
-
-## Usage
+## 🔌 API Usage
 
 ### Health Check
 
-Check if the service is running and healthy:
-
 ```bash
-curl http://localhost:8000/health
+curl http://localhost:18000/health
 ```
 
 Response:
@@ -199,147 +251,247 @@ Response:
 ### Transcribe Audio
 
 ```bash
-curl -X POST "http://localhost:8000/v1/audio/transcriptions" \
+curl -X POST "http://localhost:18000/v1/audio/transcriptions" \
   -H "Content-Type: multipart/form-data" \
-  -F "file=@audio.mp3"
+  -F "file=@audio.mp3" \
+  -F "language=auto" \
+  -F "response_format=text"
 ```
 
 Response:
 ```json
 {
-  "text": "Hello, this is a test transcription."
+  "text": "Transcribed text here..."
 }
 ```
 
-### List Available Models
+### SRT Subtitles
 
 ```bash
-curl http://localhost:8000/v1/models
+curl -X POST "http://localhost:18000/v1/audio/transcriptions" \
+  -F "file=@video.mp4" \
+  -F "response_format=srt" \
+  -o subtitles.srt
+```
+
+### List Models
+
+```bash
+curl http://localhost:18000/v1/models
 ```
 
 Response:
 ```json
 {
+  "object": "list",
   "data": [
     {
       "id": "glm-nano-2512",
-      "object": "model"
+      "object": "model",
+      "created": 1234567890,
+      "owned_by": "zai-org"
     }
   ]
 }
 ```
 
-## API Documentation
+### Interactive API Documentation
 
-Interactive API documentation is available at `http://localhost:8000/docs` when the server is running.
+Visit `http://localhost:18000/docs` for interactive Swagger UI documentation.
 
-You can also access Redoc documentation at `http://localhost:8000/redoc`
+## ⚙️ Configuration
 
-## Frontend Options
+Configure via environment variables in `docker-compose.yml`:
 
-For a complete speech-to-text experience, you can use these frontend applications that are compatible with this GLM-ASR server:
+```yaml
+environment:
+  # Server
+  - PORT=8000
 
-- **[NeuralWhisper](https://github.com/lsj5031/NeuralWhisper)** - A modern web-based frontend for speech transcription with real-time capabilities
-- **[WhisperSqueak](https://github.com/lsj5031/WhisperSqueak)** - A lightweight desktop application for audio transcription
+  # Model
+  - MODEL_ID=zai-org/GLM-ASR-Nano-2512
 
-Both frontends are designed to work seamlessly with this GLM-ASR server's OpenAI-compatible API endpoints.
+  # Chunking
+  - CHUNK_DURATION_MS=15000
+  - CHUNK_OVERLAP_MS=1000
 
-## Model
+  # VAD (Voice Activity Detection)
+  - VAD_THRESHOLD=0.6
+  - VAD_MIN_SILENCE_MS=300
 
-Uses the [GLM-ASR-Nano-2512](https://huggingface.co/zai-org/GLM-ASR-Nano-2512) model from the [ZAI organization](https://huggingface.co/zai-org), which provides efficient speech recognition with minimal computational overhead.
+  # Transcription
+  - MAX_NEW_TOKENS=500
+  - REQUEST_TIMEOUT=600
+  - MAX_AUDIO_SIZE_MB=500
 
-The GLM-ASR project is developed by the ZAI team and represents state-of-the-art multimodal speech recognition capabilities.
+  # Performance
+  - TORCH_COMPILE=false
+  - WARMUP=true
 
-## Performance
+  # Logging
+  - JSON_LOGGING=false
+```
 
-- Input audio is resampled to 16kHz (optimal for the model)
-- Supports up to 30-second chunks, automatically batched for longer audio
-- Inference runs in bfloat16 precision for efficiency
-- GPU acceleration significantly reduces inference time
+## 📊 Performance
 
-### Typical Performance
+### Benchmarks (CUDA GPU)
 
-- Short audio (< 30 seconds): ~2-5 seconds on GPU
-- Long audio (> 1 minute): Processed in 30-second chunks sequentially
-- Without GPU: ~10-30 seconds per chunk
+| Audio Duration | Processing Time | Speed Ratio |
+|----------------|-----------------|-------------|
+| 1 minute | ~8 seconds | 7.5x |
+| 10 minutes | ~75 seconds | 8x |
+| 14 minutes (video) | ~110 seconds | 7.6x |
 
-## Troubleshooting
+*Tested with WebM video, Chinese language, 5-minute chunks*
 
-### Container won't start
-- Check logs: `docker-compose logs glm-asr`
-- Ensure GPU drivers are installed: `nvidia-smi`
-- Verify Docker has GPU support: `docker run --rm --gpus all nvidia/cuda:12.8.0-runtime-ubuntu22.04 nvidia-smi`
+### Optimization Tips
 
-### Model loading is slow
-- First run downloads the model (~2GB) - this is normal
-- Model is cached in `~/.cache/huggingface/` for subsequent runs
-- Mount this directory as a volume for persistent caching
+1. **Enable torch.compile** for ~20% speed boost (may increase memory)
+2. **Adjust chunk size** based on your audio length
+3. **Use GPU** for 10-20x speedup vs CPU
+4. **Batch process** multiple files for efficiency
 
-### Out of memory errors
-- Reduce batch size or use a smaller model
-- Ensure sufficient GPU VRAM (minimum 4GB recommended)
-- Monitor with: `nvidia-smi -l 1`
-
-### Transcription is inaccurate
-- Ensure audio is clear and at 16kHz sample rate
-- Try with different audio preprocessing
-- Audio longer than 60 seconds is chunked automatically
-
-## Docker Best Practices
-
-The Dockerfile uses:
-- **Multi-stage builds**: Smaller final image size
-- **Non-root user**: Enhanced security (appuser, UID 1000)
-- **Health checks**: Automatic container health monitoring
-- **Official PyTorch base**: Latest CUDA/cuDNN support
-- **Proper layer caching**: Faster rebuilds
-
-## Development
+## 🛠️ Development
 
 ### Running Tests
-```bash
-# Run linting
-make lint
 
-# Run container smoke test
-docker build -t glm-asr:test .
-docker run --rm glm-asr:test python -c "from server import app; print('OK')"
+```bash
+# Test CLI
+./test_cli.sh
+
+# Test with actual audio
+make transcribe INPUT=/app/data/test-audio.mp3
+
+# View logs
+docker compose logs -f glm-asr
 ```
 
 ### Building for Development
+
 ```bash
-docker build -t glm-asr:dev .
-docker run -it --rm --gpus all -p 8000:8000 glm-asr:dev
+# Build with no cache
+docker compose build --no-cache
+
+# Run with shell access
+docker compose run --rm glm-asr /bin/bash
+
+# Test Python syntax
+python3 -m py_compile glm_asr_cli.py
 ```
 
-## Contributing
+## 🔍 Troubleshooting
 
-Contributions are welcome! Please feel free to submit a pull request.
+### Container Issues
 
-We especially welcome:
+**Container won't start**
+```bash
+# Check logs
+docker compose logs glm-asr
+
+# Verify GPU
+nvidia-smi
+
+# Test GPU access
+docker run --rm --gpus all nvidia/cuda:12.8.0-runtime-ubuntu22.04 nvidia-smi
+```
+
+**Model loading is slow**
+- First run downloads ~2GB model (normal)
+- Model cached in `~/.cache/huggingface/`
+- Subsequent runs load in ~10 seconds
+
+### Transcription Issues
+
+**Out of memory errors**
+```bash
+# Reduce chunk size in docker-compose.yml
+- CHUNK_DURATION_MS=10000
+
+# Monitor GPU
+watch -n 1 nvidia-smi
+```
+
+**Inaccurate transcription**
+- Ensure clear audio quality
+- Try different language codes
+- Check audio is 16kHz (server auto-converts)
+- Longer audio is automatically chunked
+
+### File Issues
+
+**File not found**
+```bash
+# Ensure file is in data directory
+ls -la data/
+
+# Use correct path (/app/data/...)
+make transcribe INPUT=/app/data/filename.mp3
+```
+
+**Unsupported format**
+- The service supports all FFmpeg formats
+- Test with: `ffmpeg -i yourfile.ext`
+- Convert to common format if needed
+
+## 📚 Documentation
+
+- **[CLI_USAGE.md](CLI_USAGE.md)** - Comprehensive CLI guide
+- **[SUPPORTED_FORMATS.md](SUPPORTED_FORMATS.md)** - All supported formats
+- **[IMPLEMENTATION_SUMMARY.md](IMPLEMENTATION_SUMMARY.md)** - Implementation details
+- **[TEST_RESULTS.md](TEST_RESULTS.md)** - Test results and benchmarks
+
+## 🌐 Frontend Options
+
+For a complete speech-to-text experience:
+
+- **[NeuralWhisper](https://github.com/lsj5031/NeuralWhisper)** - Modern web-based frontend with real-time capabilities
+- **[WhisperSqueak](https://github.com/lsj5031/WhisperSqueak)** - Lightweight desktop application
+
+Both frontends are fully compatible with this GLM-ASR server.
+
+## 🤖 Model Information
+
+Uses the [GLM-ASR-Nano-2512](https://huggingface.co/zai-org/GLM-ASR-Nano-2512) model from the [ZAI organization](https://huggingface.co/zai-org).
+
+**Model Features:**
+- 2512 parameters (Nano variant)
+- Multimodal speech recognition
+- State-of-the-art accuracy
+- Efficient inference with bfloat16
+
+## 🏆 Docker Best Practices
+
+The Dockerfile implements:
+- ✅ Multi-stage builds for smaller images
+- ✅ Non-root user (appuser, UID 1000)
+- ✅ Health checks for orchestration
+- ✅ Official PyTorch base with CUDA/cuDNN
+- ✅ Proper layer caching for fast rebuilds
+- ✅ Minimal attack surface
+
+## 🤝 Contributing
+
+Contributions welcome! We especially value:
 - Performance optimizations
 - Documentation improvements
-- Additional model support
+- Additional format support
 - Testing enhancements
-- Docker optimization ideas
+- Docker optimizations
 
-## Acknowledgments
+## 📜 Acknowledgments
 
-This project builds upon the excellent work of:
+Built upon excellent work by:
+- **GLM-ASR** - Speech recognition model by [ZAI Organization](https://huggingface.co/zai-org)
+- **faster-whisper-server** - Architecture by [Fedir Zadniprovskyi](https://github.com/fedirz/faster-whisper-server)
+- **FastAPI** - Python web framework
+- **HuggingFace** - Transformers library and model hub
+- **PyTorch** - Deep learning infrastructure
 
-- **GLM-ASR** - The underlying speech recognition model by the ZAI organization ([zai-org/GLM-ASR-Nano-2512](https://huggingface.co/zai-org/GLM-ASR-Nano-2512))
-- **faster-whisper-server** - Inspired by [Fedir Zadniprovskyi's architecture](https://github.com/fedirz/faster-whisper-server) for OpenAI-compatible speech API servers
-- **FastAPI** - For the excellent Python web framework
-- **HuggingFace** - For the Transformers library and model hub
-- **PyTorch** - For deep learning infrastructure
+## 📄 License
 
-## License
+MIT License - See [LICENSE](LICENSE) file for details
 
-MIT License - See LICENSE file for details
-
-## Citation
-
-If you use GLM-ASR in your research, please cite the original GLM-ASR model from ZAI organization:
+## 📖 Citation
 
 ```bibtex
 @misc{glm-asr,
@@ -349,3 +501,11 @@ If you use GLM-ASR in your research, please cite the original GLM-ASR model from
   url={https://huggingface.co/zai-org}
 }
 ```
+
+## 🌟 Star History
+
+If you find this project useful, please consider giving it a star ⭐️
+
+---
+
+**Made with ❤️ by the GLM-ASR community**

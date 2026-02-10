@@ -2,7 +2,19 @@
 """
 Example client for GLM-ASR server with automatic chunking for long audio.
 
-Usage:
+This script is kept for backward compatibility. For a better CLI experience,
+use the new glm_asr_cli.py script instead:
+
+    # Via Docker Compose
+    docker compose exec glm-asr python glm_asr_cli.py transcribe /app/data/input.mp3
+
+    # Via Makefile
+    make transcribe INPUT=/app/data/input.mp3
+
+    # Via wrapper script
+    ./glm-asr.sh transcribe data/input.mp3
+
+Usage (legacy):
     python client_example.py input.mp3 --output transcript.txt
 """
 
