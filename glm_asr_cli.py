@@ -169,13 +169,13 @@ def transcribe_file_srt(
     print("Processing for SRT output...")
     
     audio = AudioSegment.from_file(audio_path)
-    chunk_duration_ms = 5 * 60 * 1000  # 5 minutes
+    chunk_windows = _build_chunk_windows(chunks, len(audio))
     segments = []
     
     with tqdm(total=len(chunks), desc="Transcribing (SRT)", unit="chunk") as pbar:
-        for i, chunk in enumerate(chunks, 1):
-            start_ms = (i - 1) * chunk_duration_ms
-            end_ms = min(start_ms + len(chunk), len(audio))
+        for i, (chunk, (start_ms, end_ms)) in enumerate(
+            zip(chunks, chunk_windows), 1
+        ):
             
             pbar.set_postfix({
                 "chunk": f"{i}/{len(chunks)}",
@@ -216,6 +216,22 @@ def transcribe_file_srt(
         print(f"\nSRT transcript saved to: {output_path}")
     
     return srt_output
+
+
+def _build_chunk_windows(
+    chunks: list[AudioSegment], total_duration_ms: int
+) -> list[tuple[int, int]]:
+    """Build cumulative (start_ms, end_ms) windows for chunk timing."""
+    windows: list[tuple[int, int]] = []
+    elapsed_ms = 0
+
+    for chunk in chunks:
+        start_ms = elapsed_ms
+        end_ms = min(start_ms + len(chunk), total_duration_ms)
+        windows.append((start_ms, end_ms))
+        elapsed_ms = end_ms
+
+    return windows
 
 
 def segments_to_srt(segments: list) -> str:
